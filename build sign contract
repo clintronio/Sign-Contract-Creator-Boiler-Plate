@@ -1,0 +1,157 @@
+string standalone.buildSignTemplate()
+{
+// =====================================================================
+// Build a Zoho Sign template from a blank PDF, with every signer role
+// and form field placed in code (no template designer).
+//
+// Run once as a standalone function (return type: string).
+// Needs a Zoho Sign connection named "zohosign" with scope
+// ZohoSign.templates.ALL
+// Coordinates are PDF points, origin top-left, US Letter 612 x 792.
+// page_no is zero-based (page 1 = 0).
+// =====================================================================
+templateName = "Sample Service Agreement";
+pdfUrl = "https://example.com/path/to/blank-agreement.pdf";
+signBase = "https://sign.zoho.com/api/v1";
+// change for .eu / .in / .com.au
+// ---------------------------------------------------------------------
+// 1. Download the blank PDF (Deluge can only attach files that came
+//    back from an invokeurl call)
+// ---------------------------------------------------------------------
+pdfFile = invokeurl
+[
+	url :pdfUrl
+	type :GET
+];
+pdfFile.setParamName("file");
+// ---------------------------------------------------------------------
+// 2. Create the template with the file
+// ---------------------------------------------------------------------
+createData = {"templates":{"template_name":templateName,"is_sequential":true}};
+parts = List();
+parts.add(pdfFile);
+parts.add({"paramName":"data","content":createData.toString(),"stringPart":"true"});
+createResp = invokeurl
+[
+	url :signBase + "/templates"
+	type :POST
+	files:parts
+	connection:"zohosign"
+];
+if(createResp.get("status") != "success")
+{
+	return "Create failed: " + createResp.get("message");
+}
+templateId = createResp.get("templates").get("template_id");
+documentId = createResp.get("templates").get("document_ids").get(0).get("document_id");
+info "Template created: " + templateId;
+// ---------------------------------------------------------------------
+// 3. Define signer roles (signing_order controls who signs first)
+// ---------------------------------------------------------------------
+roles = List();
+roles.add({"role":"Client","action_type":"SIGN","signing_order":1,"recipient_name":"","recipient_email":"","verify_recipient":false});
+roles.add({"role":"Provider","action_type":"SIGN","signing_order":2,"recipient_name":"","recipient_email":"","verify_recipient":false});
+roleResp = invokeurl
+[
+	url :signBase + "/templates/" + templateId
+	type :PUT
+	parameters:{"data":{"templates":{"actions":roles}}.toString()}
+	connection:"zohosign"
+];
+if(roleResp.get("status") != "success")
+{
+	return "Adding roles failed: " + roleResp.get("message");
+}
+actionIdByRole = Map();
+for each  act in roleResp.get("templates").get("actions")
+{
+	actionIdByRole.put(act.get("role"),act.get("action_id"));
+}
+// ---------------------------------------------------------------------
+// 4. FIELD MAP - one line per blank in the document
+//    owner: "prefill"  = filled by the sender (/createdocument field_data)
+//           <role name> = filled by that signer while signing
+//    x, y, w, h in points, measured from the top-left of the page
+// ---------------------------------------------------------------------
+specs = List();
+// ----- Page 1 -----
+specs.add({"label":"Agreement_Date","owner":"prefill","type":"CustomDate","page":0,"x":450,"y":50,"w":110,"h":12});
+specs.add({"label":"Client_Name","owner":"prefill","type":"Textfield","page":0,"x":110,"y":160,"w":300,"h":13});
+specs.add({"label":"Client_Address","owner":"prefill","type":"Textfield","page":0,"x":110,"y":185,"w":300,"h":13});
+specs.add({"label":"Service_Description","owner":"prefill","type":"Textfield","page":0,"x":50,"y":240,"w":510,"h":14});
+specs.add({"label":"Client_Initial_P1","owner":"Client","type":"Initial","page":0,"x":50,"y":700,"w":54,"h":18});
+// ----- Page 2 -----
+specs.add({"label":"Client_Signature","owner":"Client","type":"Signature","page":1,"x":50,"y":600,"w":240,"h":26});
+specs.add({"label":"Client_Printed_Name","owner":"prefill","type":"Textfield","page":1,"x":50,"y":640,"w":240,"h":13});
+specs.add({"label":"Provider_Signature","owner":"Provider","type":"Signature","page":1,"x":330,"y":600,"w":230,"h":26});
+specs.add({"label":"Signed_Date","owner":"prefill","type":"CustomDate","page":1,"x":330,"y":640,"w":120,"h":13});
+// ---------------------------------------------------------------------
+// 5. Turn the map into Zoho Sign field objects
+// ---------------------------------------------------------------------
+categoryByType = {"Textfield":"textfield","CustomDate":"datefield","Signature":"image","Initial":"image"};
+built = List();
+for each  s in specs
+{
+	f = Map();
+	f.put("field_name",s.get("label"));
+	f.put("field_label",s.get("label"));
+	f.put("field_type_name",s.get("type"));
+	f.put("field_category",categoryByType.get(s.get("type")));
+	f.put("document_id",documentId);
+	f.put("page_no",s.get("page"));
+	f.put("x_coord",s.get("x"));
+	f.put("y_coord",s.get("y"));
+	f.put("abs_width",s.get("w"));
+	f.put("abs_height",s.get("h"));
+	if(s.get("type") == "Textfield" || s.get("type") == "CustomDate")
+	{
+		f.put("text_property",{"font_size":10,"font_color":"000000"});
+	}
+	// signer fields are required, sender prefill fields are not
+	f.put("is_mandatory",s.get("owner") != "prefill");
+	built.add({"owner":s.get("owner"),"field":f});
+}
+// ---------------------------------------------------------------------
+// 6. Attach signer fields to each role and prefill fields to the file
+// ---------------------------------------------------------------------
+fieldActions = List();
+for each  r in roles
+{
+	roleFields = List();
+	for each  b in built
+	{
+		if(b.get("owner") == r.get("role"))
+		{
+			roleFields.add(b.get("field"));
+		}
+	}
+	action = r;
+	action.put("action_id",actionIdByRole.get(r.get("role")));
+	action.put("fields",roleFields);
+	fieldActions.add(action);
+}
+prefillFields = List();
+for each  b in built
+{
+	if(b.get("owner") == "prefill")
+	{
+		prefillFields.add(b.get("field"));
+	}
+}
+docFields = List();
+docFields.add({"document_id":documentId,"fields":prefillFields});
+fieldData = {"templates":{"actions":fieldActions,"document_fields":docFields}};
+fieldResp = invokeurl
+[
+	url :signBase + "/templates/" + templateId
+	type :PUT
+	parameters:{"data":fieldData.toString()}
+	connection:"zohosign"
+];
+if(fieldResp.get("status") != "success")
+{
+	return "Adding fields failed: " + fieldResp.get("message");
+}
+info "Fields placed: " + specs.size();
+return "Template " + templateId + " ready with " + specs.size() + " fields";
+}
